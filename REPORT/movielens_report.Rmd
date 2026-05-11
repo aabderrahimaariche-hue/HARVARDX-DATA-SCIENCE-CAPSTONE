@@ -1,0 +1,577 @@
+---
+title: "MovieLens Rating Prediction: A regularized  Bias Model with Iterative Coordinate Descent"
+author: "Aariche aabderrahim"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4
+)
+```
+
+```{r libraries, echo=FALSE}
+library(tidyverse)
+library(data.table)
+library(caret)
+library(lubridate)
+```
+
+```{r load-results, echo=FALSE}
+# Load all pre-computed objects from the final model run
+load("../RESULTS/movielens_results.RData")
+```
+
+------------------------------------------------------------------------
+
+# Introduction & Overview
+
+## Project Background
+
+This report presents the methodology, implementation, and results of a
+movie rating prediction system developed for the Harvard Data Science
+Capstone. The objective is to build a model that predicts user ratings
+on the MovieLens dataset with the lowest achievable Root Mean Squared
+Error (RMSE).
+
+The MovieLens dataset contains approximately 10 million ratings
+submitted by users for a large catalogue of films. Each rating record
+contains a user identifier, a movie identifier, a numerical rating (0.5
+to 5.0 in 0.5 increments), a Unix timestamp, a movie title, and one or
+more genre labels.
+
+## Objective
+
+The primary goal is to predict the rating $\hat{r}_{u,i}$ that user $u$
+would assign to movie $i$, minimising the RMSE defined as:
+
+$$\text{RMSE} = \sqrt{\frac{1}{N} \sum_{u,i} \left(\hat{r}_{u,i} - r_{u,i}\right)^2}$$
+
+where $r_{u,i}$ is the true observed rating and $N$ is the total number
+of predictions.
+
+## Approach Summary
+
+The model extends a regularized baseline approach — starting from the
+global mean rating and sequentially estimating bias terms for movie,
+user, year, month, week, and genre effects. Bias estimates are obtained
+through iterative coordinate descent, where all effects are updated in
+turn and the process repeats until convergence, producing stable and
+robust estimates.
+
+------------------------------------------------------------------------
+
+# Methods & Model Description
+
+## Data Partitioning
+
+The `edx` dataset is split into a training set (90%) and a held-out test
+set (10%) using stratified sampling via `createDataPartition`, with a
+fixed seed for reproducibility.
+
+Cold-start entries (users or movies appearing only in the test set) are
+handled implicitly: missing bias values are imputed with zero, causing
+predictions to fall back to the global mean or any available partial
+bias.
+
+## Feature Engineering
+
+Three temporal features are extracted from the Unix timestamp using
+`floor_date` (rather than `round_date`) to avoid attributing ratings to
+future time periods. Genre labels, originally stored as pipe-delimited
+strings, are parsed into individual genre tokens. A per-rating weight of
+$1/n_\text{genres}$ is assigned so that a rating's total genre
+contribution sums to 1 regardless of how many genres a movie belongs to.
+A stable `row_id` is assigned immediately after feature engineering and
+preserved throughout all subsequent operations to ensure correct joins.
+
+## Baseline Model
+
+The simplest possible predictor is the global mean rating $\mu$ computed
+over the training set:
+
+$$\hat{r}_{u,i} = \mu$$
+
+This serves as the performance baseline against which all model
+improvements are measured.
+
+## Regularized Bias Model
+
+The full prediction is formulated as a sum of the global mean and six
+additive bias terms:
+
+$$\hat{r}_{u,i} = \mu + b_i + b_u + b_y + b_m + b_w + b_g$$
+
+where:
+
+| Term | Description |
+|------------------------------------|------------------------------------|
+| $\mu$ | Global mean rating |
+| $b_i$ | Movie bias — captures whether a film is rated above or below average |
+| $b_u$ | User bias — captures individual rating tendencies |
+| $b_y$ | Year bias — captures year‑level temporal trends |
+| $b_m$ | Month bias — captures month‑level seasonal patterns |
+| $b_w$ | Week bias — captures week‑level fluctuations |
+| $b_g$ | Genre bias — captures genre preference patterns (weighted) |
+
+Each bias term is estimated using regularized least squares. For a
+generic effect $b_x$ with regularization parameter $\lambda$:
+
+$$b_x = \frac{\sum_{j \in S_x} r_j^*}{|S_x| + \lambda}$$
+
+where $r_j^*$ is the residual after removing all other known effects,
+and $S_x$ is the set of ratings belonging to group $x$. Larger $\lambda$
+shrinks estimates for groups with few observations toward zero, guarding
+against overfitting on rare movies, users, or time bins.
+
+The genre bias is computed at the level of individual genre tokens. Each
+rating's genre contribution is the weighted sum of the bias values of
+all genres it belongs to:
+
+$$b_g^{(j)} = \sum_{g \in G_j} w_j \cdot b_g$$
+
+where $w_j = 1/n_{\text{genres},j}$ and $G_j$ is the set of genres for
+rating $j$. This is implemented via an unnested genre table joined back
+to the rating level, avoiding `rowwise()` iteration entirely.
+
+## regularization Parameter Tuning
+
+The regularization parameter $\lambda$ is selected via a held-out
+validation split of the training set (80% training, 20% validation). For
+each candidate value in $\lambda \in \{1, 1.5, 2, \ldots, 10\}$, all six
+bias terms are estimated on the training portion and evaluated on the
+validation portion. The $\lambda$ minimising validation RMSE is retained
+for final model training.
+
+## Iterative Coordinate Descent
+
+Rather than estimating each bias term in a single sequential pass, the
+model employs iterative coordinate descent: all six bias terms are
+updated in turn, each time conditioning on the current estimates of all
+other terms. This process repeats until the change in training RMSE
+falls below a convergence tolerance of $10^{-5}$ or a maximum of 30
+iterations is reached.
+
+At each iteration, all current bias values are joined onto the training
+data to form a base table. Each effect is then updated by computing the
+residual after removing the contributions of all other effects, and
+applying the regularized sum formula. The genre effect is handled by
+joining through the unnested genre table and re‑aggregating to the
+rating level.
+
+------------------------------------------------------------------------
+
+# Code Engineering & Design Decisions
+
+## Reusable Functions
+
+Three operations are needed in multiple places — feature engineering,
+genre contribution lookup, and full prediction assembly. Each is
+encapsulated in a named function (`add_features()`,
+`compute_genre_contrib()`, `build_predictions()`). This follows the DRY
+principle and ensures consistency.
+
+## Stable Row Identity
+
+A unique, stable integer identifier `row_id` is stamped once at the
+source (immediately after feature engineering) and never reassigned. It
+serves as the join key that reconnects unnested genre rows back to their
+parent rating. This prevents the latent bug of generating new row IDs
+inside a function after the data has been reordered.
+
+## Vectorised Genre Handling
+
+Instead of using `rowwise()` loops (which are extremely slow on large
+data), the script expands the genre list to one row per genre token,
+performs vectorised joins, and then aggregates back to the rating level.
+This uses optimised C‑level operations and runs orders of magnitude
+faster.
+
+## Pre‑allocation & Hoisting
+
+Result containers are pre‑allocated with their final length to avoid
+repeated memory reallocation. The expensive unnesting operation is
+performed once outside the training loop and reused across all
+iterations.
+
+## NA Imputation for Cold‑Start
+
+Missing bias values after `left_join` are replaced with zero, so that
+unseen users, movies, or genres fall back to the global mean plus any
+available partial information.
+
+## Reproducibility
+
+Explicit `set.seed()` calls with different seeds for the train/test
+split and validation split ensure that all random steps are
+reproducible. \## Model Serialisation: Reusable Predictor Closure
+
+After training, the model is saved not only as raw bias tables but also
+as a **closure** (a function that carries all bias values inside it).
+The `make_predictor()` function captures the global mean $\mu$ and the
+six bias tables, and returns a single function `predict_ratings()`.
+
+This predictor function: - Takes a data frame with columns `userId`,
+`movieId`, `timestamp`, `genres`. - Automatically performs feature
+engineering (temporal binning, genre splitting, weighting). - Joins all
+pre‑computed bias terms (coalescing missing values to zero). - Returns a
+vector of predicted ratings.
+
+The predictor is saved as an `.rds` file (`predict_ratings.rds`).
+Loading it with `readRDS()` restores a fully functional prediction
+function – no retraining, no repeated code, and no risk of inconsistent
+feature engineering.
+
+**Example usage:**
+
+```{r predict_ratings, eval=FALSE,echo=TRUE}
+
+
+predict_ratings <- readRDS("../RESULTS/predict_ratings.rds")
+
+new_ratings <- data.frame(
+  userId    = c(343, 233),
+  movieId   = c(1123, 1123),
+  title = c("Perfect Candidate, A (1996)","Perfect Candidate, A (1996)"),
+  timestamp = c(974595468, 974595468),
+  genres    = c("Documentary", "Documentary")
+)
+
+predictions <- predict_ratings(new_ratings)
+new_ratings$p_rating <- round(predictions,2)
+new_ratings$r_rating <- round(round(predictions, 1)/0.5)*0.5
+
+
+knitr::kable(
+  new_ratings,
+  caption = "Predictions using the deployment‑ready predictor",
+  col.names = c("userId", "movieId","title", "timestamp", "genres","p_rating", "r_rating"),
+  align = c("l", "l", "c","c", "c", "r","r")
+)
+
+```
+
+------------------------------------------------------------------------
+
+# Results & RMSE
+
+## Baseline Performance
+
+The global mean predictor achieves an RMSE of
+**`r round(rmse_baseline, 4)`** on the test set.
+
+## Lambda Tuning Results
+
+The optimal regularization parameter was found to be
+**`r best_lambda`**, which minmizes the validation RMSE as shown below.
+
+```{r lambda-plot}
+plot(lambdas, val_rmse, type = "b",
+     xlab = "Lambda", ylab = "Validation RMSE",
+     main = "Lambda Tuning: Validation RMSE vs regularization Strength")
+abline(v = best_lambda, col = "red", lty = 2)
+legend("topright", legend = paste("Best lambda =", best_lambda),
+       col = "red", lty = 2)
+```
+
+## Step-by-Step RMSE Improvement
+
+The table below shows the RMSE on the test set as each bias term is
+added incrementally, demonstrating the individual contribution of every
+effect.
+
+```{r step-rmse-table}
+step_results <- data.frame(
+  Step = c(
+    "Baseline (global mean)",
+    "+ Movie bias",
+    "+ User bias",
+    "+ Year bias",
+    "+ Month bias",
+    "+ Week bias",
+    "+ Genre bias"
+  ),
+  RMSE = round(c(
+    rmse_step_baseline,
+    rmse_step_movie,
+    rmse_step_user,
+    rmse_step_year,
+    rmse_step_month,
+    rmse_step_week,
+    rmse_step_genre
+  ), 4),
+  Improvement = round(c(
+    0,
+    rmse_step_baseline - rmse_step_movie,
+    rmse_step_movie    - rmse_step_user,
+    rmse_step_user     - rmse_step_year,
+    rmse_step_year     - rmse_step_month,
+    rmse_step_month    - rmse_step_week,
+    rmse_step_week     - rmse_step_genre
+  ), 4)
+)
+
+knitr::kable(
+  step_results,
+  caption  = "Test RMSE after adding each bias term",
+  col.names = c("Model Step", "Test RMSE", "RMSE Reduction"),
+  align    = c("l", "c", "c")
+)
+```
+
+## Final Model Performance
+
+After iterative coordinate descent training with the selected $\lambda$,
+the model is evaluated on the held‑out test set. The final test RMSE is
+**`r round(rmse_final, 4)`**.
+
+## Interpreting the RMSE Table: Task‑Dependent Decisions
+
+```         
+
+The improvement column shows how much each bias term reduces RMSE *under a random split where all movies appear in both training and test sets*. However, the optimal model differs by deployment task. Use this decision map to avoid “RMSE delusion” – treating the numbers as absolute.
+```
+
+```{r Task‑dependent interpretation of the RMSE table }
+decision_map <- data.frame(
+  Task = c("**Static catalogue** (same movies, only new ratings)",
+           "**Cold‑start** (new, unseen movies)"),
+  What = c("Movie and user biases dominate; genre adds near‑zero.",
+           "The table *underestimates* genre because movie bias steals its signal."),
+  Action = c("Keep effects above a threshold (e.g., 0.0004). Drop genre bias – it adds no value. Model stays simple and fast.",
+             "**Cannot rely on this table.** Build a separate evaluation: hold out entire movies. Then genre bias will likely show large improvement.")
+)
+
+knitr::kable(decision_map, caption = "Task‑dependent interpretation of the RMSE table")
+```
+
+## Summary Table
+
+```{r results-table}
+results <- data.frame(
+  Model = c(
+    "Baseline (global mean)",
+    "regularized  Bias Model (Coordinate Descent)"
+  ),
+  RMSE = c(
+    round(rmse_baseline, 4),
+    round(rmse_final, 4)
+  ),
+  `Improvement (%)` = c(
+    "—",
+    round((rmse_baseline - rmse_final) / rmse_baseline * 100, 2)
+  )
+)
+
+knitr::kable(
+  results,
+  caption   = "Model performance on the held-out test set",
+  col.names = c("Model", "Test RMSE", "Improvement over Baseline (%)"),
+  align     = c("l", "c", "c")
+)
+```
+
+------------------------------------------------------------------------
+
+# Visualizations & Plots
+
+## Rating Distribution
+
+```{r rating-dist, message=TRUE, warning=TRUE}
+train_set |>
+  ggplot(aes(x = rating)) +
+  geom_histogram(binwidth = 0.5, fill = "steelblue", colour = "white") +
+  scale_x_continuous(breaks = seq(0.5, 5, 0.5)) +
+  labs(
+    title = "Distribution of Ratings in the Training Set",
+    x     = "Rating",
+    y     = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Ratings per Movie (Log Scale)
+
+```{r ratings-per-movie}
+train_set %>%
+  count(movieId) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  scale_x_log10() +
+  labs(
+    title = "Number of Ratings per Movie (log scale)",
+    x     = "Number of Ratings",
+    y     = "Number of Movies"
+  ) +
+  theme_minimal()
+```
+
+## Average Rating Over Time (Year)
+
+```{r avg-rating-year}
+train_set %>%
+  group_by(year_bin) %>%
+  summarise(avg_rating = mean(rating), .groups = "drop") %>%
+  ggplot(aes(x = year_bin, y = avg_rating)) +
+  geom_line(colour = "steelblue") +
+  geom_point(colour = "steelblue") +
+  labs(
+    title = "Average Rating by Year",
+    x     = "Year",
+    y     = "Average Rating"
+  ) +
+  theme_minimal()
+```
+
+## Top Movie Biases
+
+```{r top-movie-biases}
+if (exists("edx")) {
+  movie_bias_final %>%
+    left_join(edx %>% distinct(movieId, title), by = "movieId") %>%
+    arrange(desc(b_i)) %>%
+    slice_head(n = 15) %>%
+    ggplot(aes(x = reorder(title, b_i), y = b_i)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = "Top 15 Movies by Positive Bias (b_i)",
+      x     = NULL,
+      y     = "Movie Bias"
+    ) +
+    theme_minimal()
+} else {
+  cat("Movie titles not available – plot omitted.\n")
+}
+```
+
+## Genre Bias
+
+```{r genre-bias}
+genre_bias_final %>%
+  arrange(desc(b_g)) %>%
+  ggplot(aes(x = reorder(genre_single, b_g), y = b_g)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Genre Bias Estimates",
+    x     = "Genre",
+    y     = "Genre Bias (b_g)"
+  ) +
+  theme_minimal()
+```
+
+## Residual Distribution
+
+```{r residuals}
+test_pred %>%
+  mutate(residual = rating - pred) %>%
+  ggplot(aes(x = residual)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", colour = "white") +
+  labs(
+    title = "Distribution of Prediction Residuals on Test Set",
+    x     = "Residual (True − Predicted)",
+    y     = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Residuals vs Predicted (Diagnostic)
+
+```{r residual-plot}
+test_pred %>%
+  mutate(residual = rating - pred) %>%
+  ggplot(aes(x = pred, y = residual)) +
+  geom_point(alpha = 0.05, size = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(color = "blue", se = FALSE) +
+  labs(
+    title = "Residuals vs. Predicted Ratings",
+    x     = "Predicted rating",
+    y     = "Residual"
+  ) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+## Summary
+
+This project developed a regularized additive bias model for movie
+rating prediction on the MovieLens dataset. Starting from a global mean
+baseline (RMSE = `r round(rmse_baseline, 4)`), the final model trained
+via iterative coordinate descent achieves a test RMSE of
+`r round(rmse_final, 4)` — an improvement of
+`r round((rmse_baseline - rmse_final)/rmse_baseline * 100, 2)`% over the
+baseline. The step-by-step analysis shows that movie and user biases
+account for the largest RMSE reductions, with genre and temporal effects
+contributing additional gains. All estimates are regularized with an
+optimally tuned $\lambda$ and converge to a stable solution through
+iterative updates.
+
+### The Danger of RMSE Delusion
+
+Due to the bias absorption by movie_bias a single RMSE number from a
+standard random split can be misleading if interpreted without
+considering the deployment task. For a static catalogue (predicting
+ratings for the same set of movies), dropping negligible biases like
+genre (0.0001 improvement) does not hurt accuracy. For a cold‑start
+system (recommending new movies), genre becomes critical – but its value
+is invisible in the standard table because movie bias already absorbs
+genre signal.
+
+Therefore, always ask: *What is the intended use case?* Then design the
+evaluation protocol and model accordingly. The step‑wise RMSE table is a
+tool, not a verdict. in general the [Step-by-Step RMSE Improvement]
+table is a representative of the base the model was been built for and
+doesn't mean genre isn't a valuable feature we can use to forecast the
+rating perhaps it could be very useful feature if the task change even
+if the RMSE scale show it's not
+
+## Limitations
+
+The model is linear and additive, missing potential interaction effects
+(e.g., a user who specifically loves action films). Temporal effects
+(year, month, week) contribute modestly compared to movie and user
+biases.
+
+## Potential Extensions
+
+-   **Deployment ready:** The saved predictor function allows easy
+    integration into a production environment (e.g., a Shiny app or API)
+    without any R Markdown or training code.
+
+-   Matrix factorisation (SVD/ALS) to capture latent user‑item
+    interactions.
+
+-   More granular temporal dynamics (e.g., drifting user biases over
+    time).
+
+-   Ensemble with a latent factor model.
+
+------------------------------------------------------------------------
+
+*Report generated using R Markdown. All analysis was performed in R
+using the `tidyverse`, `data.table`, `caret`, and `lubridate` packages.
+Results are based on pre‑computed outputs from the final model script.*
