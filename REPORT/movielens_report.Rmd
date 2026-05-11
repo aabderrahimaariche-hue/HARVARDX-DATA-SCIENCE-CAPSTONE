@@ -124,7 +124,7 @@ $$\hat{r}_{u,i} = \mu + b_i + b_u + b_y + b_m + b_w + b_g$$
 where:
 
 | Term | Description |
-|------------------------------------|------------------------------------|
+|----|----|
 | $\mu$ | Global mean rating |
 | $b_i$ | Movie bias — captures whether a film is rated above or below average |
 | $b_u$ | User bias — captures individual rating tendencies |
